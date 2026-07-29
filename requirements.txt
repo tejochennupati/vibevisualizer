@@ -1,4 +1,6 @@
 streamlit
-openai
+groq
 python-dotenv
 requests
+aiohttp
+nest-asyncio
