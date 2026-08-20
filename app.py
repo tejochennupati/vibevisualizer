@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from groq import Groq
 from concurrent.futures import ThreadPoolExecutor
 
+MEMORY_FILE = "user_vibe_memory.json"
+
 # ---------------------------------------------------------
 # 1. SETUP & CONFIGURATION
 # ---------------------------------------------------------
@@ -180,6 +182,54 @@ if "last_query" not in st.session_state:
     st.session_state["last_query"] = ""
 if "selected_movie" not in st.session_state:
     st.session_state["selected_movie"] = None
+
+# Memory Helper Functions
+def init_memory():
+    if "search_history" not in st.session_state:
+        st.session_state["search_history"] = []
+    if "favorite_movies" not in st.session_state:
+        st.session_state["favorite_movies"] = []
+    if "vibe_preference" not in st.session_state:
+        st.session_state["vibe_preference"] = "All Vibes"
+
+    if os.path.exists(MEMORY_FILE) and not st.session_state["search_history"]:
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                st.session_state["search_history"] = json.load(f)
+        except Exception:
+            st.session_state["search_history"] = []
+
+def save_search_to_memory(query: str):
+    if query and query.strip():
+        q_clean = query.strip()
+        if not st.session_state["search_history"] or st.session_state["search_history"][0] != q_clean:
+            st.session_state["search_history"].insert(0, q_clean)
+            st.session_state["search_history"] = st.session_state["search_history"][:8]
+            try:
+                with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                    json.dump(st.session_state["search_history"], f, indent=2)
+            except Exception:
+                pass
+
+def toggle_favorite(movie: dict):
+    favs = st.session_state["favorite_movies"]
+    existing_ids = [m["id"] for m in favs if isinstance(m, dict) and "id" in m]
+    
+    if movie["id"] in existing_ids:
+        st.session_state["favorite_movies"] = [m for m in favs if m.get("id") != movie["id"]]
+    else:
+        st.session_state["favorite_movies"].append(movie)
+
+def clear_search_history():
+    st.session_state["search_history"] = []
+    if os.path.exists(MEMORY_FILE):
+        try:
+            os.remove(MEMORY_FILE)
+        except Exception:
+            pass
+
+def clear_favorites():
+    st.session_state["favorite_movies"] = []
 
 def clean_movie_title(raw_title: str) -> str:
     """Removes years like (2016), quotes, and extra noise from title strings."""
@@ -487,6 +537,64 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
 
 st.title("🎬 VibeVisualizer")
 st.caption("High-Yield Vibe Discovery Engine across Indian, Hollywood & World Cinema.")
+# --- SIDEBAR MEMORY CONTROL PANEL ---
+init_memory()
+
+with st.sidebar:
+    st.title("🧠 Vibe Memory")
+    
+    st.session_state["vibe_preference"] = st.selectbox(
+        "⚡ Preferred Vibe",
+        ["All Vibes", "Dark & Moody", "Cyberpunk / Synthwave", "Action & Thriller", "Feel Good / Cozy"],
+        index=0
+    )
+    
+    st.markdown("---")
+    
+    tab_favs, tab_hist = st.tabs(["⭐ Favorites", "📜 History"])
+    
+    with tab_favs:
+        if st.session_state["favorite_movies"]:
+            for fav in st.session_state["favorite_movies"]:
+                col_title, col_play, col_del = st.columns([3, 1, 1])
+                with col_title:
+                    st.caption(f"🎬 **{fav['title']}**")
+                with col_play:
+                    if st.button("▶", key=f"tab_play_{fav['id']}"):
+                        st.session_state["selected_movie"] = fav
+                        st.rerun()
+                with col_del:
+                    if st.button("❌", key=f"tab_del_fav_{fav['id']}"):
+                        toggle_favorite(fav)
+                        st.rerun()
+            st.divider()
+            if st.button("🗑️ Clear All Favorites", key="btn_clear_favs", use_container_width=True):
+                clear_favorites()
+                st.rerun()
+        else:
+            st.info("No saved movies yet.")
+
+    with tab_hist:
+        if st.session_state["search_history"]:
+            for idx, past_query in enumerate(list(st.session_state["search_history"])):
+                col_q, col_qdel = st.columns([4, 1])
+                with col_q:
+                    st.caption(f"🔍 {past_query}")
+                with col_qdel:
+                    if st.button("❌", key=f"tab_del_hist_{idx}"):
+                        st.session_state["search_history"].pop(idx)
+                        try:
+                            with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                                json.dump(st.session_state["search_history"], f, indent=2)
+                        except Exception:
+                            pass
+                        st.rerun()
+            st.divider()
+            if st.button("🗑️ Clear All History", key="btn_clear_hist", use_container_width=True):
+                clear_search_history()
+                st.rerun()
+        else:
+            st.info("No search history yet.")
 
 if not GROQ_API_KEY or not TMDB_API_KEY:
     st.error("⚠️ Missing API Keys! Please check your .env file or Streamlit secrets for GROQ_API_KEY and TMDB_API_KEY.")
@@ -516,6 +624,7 @@ if st.button("Explore Movies 🚀", type="primary"):
     if not user_query.strip():
         st.info("Please enter a vibe or movie title above!")
     else:
+        save_search_to_memory(user_query)
         st.session_state["selected_movie"] = None
         st.session_state["last_query"] = user_query
         
@@ -665,6 +774,16 @@ else:
                     st.markdown(f"<div class='card-meta'>⭐ <b>Rating:</b> {movie['rating']}/10<br>🗣️ <b>Audio:</b> {movie['audio']}</div>", unsafe_allow_html=True)
                     st.markdown(f"<div class='card-desc'>{movie['overview']}</div>", unsafe_allow_html=True)
                     
-                    if st.button("🎬 Watch & Details", key=f"card_btn_{movie['id']}_{i}_{idx}"):
-                        st.session_state["selected_movie"] = movie
-                        st.rerun()
+                    col_b1, col_b2 = st.columns(2)
+
+                    with col_b1:
+                        if st.button("🎬 Details", key=f"card_btn_{movie['id']}_{i}_{idx}"):
+                            st.session_state["selected_movie"] = movie
+                            st.rerun()
+
+                    with col_b2:
+                        is_saved = any(m.get("id") == movie["id"] for m in st.session_state["favorite_movies"])
+                        fav_label = "❤️ Saved" if is_saved else "🤍 Save"
+                        if st.button(fav_label, key=f"card_fav_{movie['id']}_{i}_{idx}"):
+                            toggle_favorite(movie)
+                            st.rerun()

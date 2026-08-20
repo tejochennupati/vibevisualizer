@@ -1,2 +1,6 @@
 .streamlit/secrets.toml
 .env
+user_vibe_memory.json
+venv/
+!.streamlit/config.toml
+.streamlit/*
