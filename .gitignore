@@ -1,6 +1,16 @@
-.streamlit/secrets.toml
+# Environment & Secrets (NEVER upload these!)
 .env
+.streamlit/secrets.toml
 user_vibe_memory.json
+
+# Virtual Environment & Python Caches
 venv/
+__pycache__/
+*.pyc
+
+# Local Vector DB Files (Keep repo light)
+movie_index.faiss
+movie_metadata.json
+
+# Allow Streamlit UI Config ONLY
 !.streamlit/config.toml
-.streamlit/*

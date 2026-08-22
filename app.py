@@ -1,32 +1,83 @@
 """
-VibeVisualizer - Movie Discovery Engine (Full Code with Surgical Fixes)
+VibeVisualizer - Movie Discovery Engine (Full Code with Vector DB & Web Fallback Cascade)
 """
 
 import os
+
+# ---------------------------------------------------------
+# PRE-IMPORT THREAD & CPU OPTIMIZATION
+# ---------------------------------------------------------
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Limit CPU threads to prevent CPU thrashing during initial load
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import re
 import json
 import urllib.parse
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import faiss
 import streamlit as st
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from groq import Groq
-from concurrent.futures import ThreadPoolExecutor
-
-MEMORY_FILE = "user_vibe_memory.json"
 
 # ---------------------------------------------------------
 # 1. SETUP & CONFIGURATION
 # ---------------------------------------------------------
 load_dotenv()
 
-def get_secret(key: str):
-    return os.getenv(key) or st.secrets.get(key, None)
+@st.cache_resource(show_spinner="⚡ Initializing Search Engine...")
+def load_embedding_model():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+
+get_embedding_model = load_embedding_model
+
+@st.cache_resource(show_spinner="📂 Loading 10k Movie Vector Index...")
+def load_vector_db():
+    index = None
+    metadata = []
+    
+    if os.path.exists("movie_index.faiss"):
+        index = faiss.read_index("movie_index.faiss")
+        
+    if os.path.exists("movie_metadata.json"):
+        with open("movie_metadata.json", "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+            
+    return index, metadata
+
+# Initialize cached references (Loaded into RAM once, shared across reloads)
+EMBEDDING_MODEL = load_embedding_model()
+FAISS_INDEX, MOVIE_METADATA = load_vector_db()
+
+def get_secret(key: str, default=None):
+    return os.getenv(key) or (st.secrets.get(key) if hasattr(st, "secrets") else None) or default
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 TMDB_API_KEY = get_secret("TMDB_API_KEY")
+GOOGLE_SEARCH_API_KEY = get_secret("GOOGLE_SEARCH_API_KEY")
+GOOGLE_CSE_ID = get_secret("GOOGLE_CSE_ID")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
+MEMORY_FILE = "user_vibe_memory.json"
+INDEX_FILE = "movie_index.faiss"
+METADATA_FILE = "movie_metadata.json"
+
+# Strict L2 similarity threshold (0.35 L2 = ~0.94 Cosine Similarity)
+DISTANCE_THRESHOLD = 0.35  
+
+# Thread-safe writeback lock
+INDEX_MUTEX = threading.Lock()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
@@ -136,6 +187,59 @@ def get_groq_client():
         return Groq(api_key=GROQ_API_KEY)
     except Exception:
         return None
+
+# ---------------------------------------------------------
+# 1.5 FAISS VECTOR DB & EMBEDDINGS INIT
+# ---------------------------------------------------------
+
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+EMBEDDING_MODEL = load_embedding_model()
+
+@st.cache_resource
+def load_vector_assets():
+    """Loads FAISS index and metadata into memory or initializes new ones."""
+    if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
+        try:
+            index = faiss.read_index(INDEX_FILE)
+            with open(METADATA_FILE, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            return index, metadata
+        except Exception:
+            pass
+    # Initialize 384-dim normalized L2 index if missing/corrupt
+    index = faiss.IndexFlatL2(384)
+    return index, {}
+
+FAISS_INDEX, VECTOR_METADATA = load_vector_assets()
+
+def append_to_vector_db_mutex(movie_obj: dict):
+    """Safely adds a movie embedding to RAM index and persists to disk under lock."""
+    if not movie_obj or not isinstance(movie_obj, dict) or "id" not in movie_obj:
+        return
+
+    m_id_str = str(movie_obj["id"])
+    if m_id_str in VECTOR_METADATA.values():
+        return
+
+    doc = f"{movie_obj.get('title', '')} {movie_obj.get('genres', '')} {movie_obj.get('overview', '')}"
+    vec = EMBEDDING_MODEL.encode([doc], convert_to_numpy=True)
+    faiss.normalize_L2(vec)
+
+    with INDEX_MUTEX:
+        new_faiss_id = FAISS_INDEX.ntotal
+        FAISS_INDEX.add(vec)
+        VECTOR_METADATA[str(new_faiss_id)] = movie_obj
+
+        try:
+            faiss.write_index(FAISS_INDEX, INDEX_FILE)
+            with open(METADATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(VECTOR_METADATA, f, indent=2)
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------
 # 2. TMDB CACHE & FORMATTING
@@ -385,10 +489,11 @@ def fetch_fallback_trending_movies(target_language: str = "All Languages"):
     return []
 
 # ---------------------------------------------------------
-# 4. GROQ LLM & HYBRID PIPELINE
+# 4. PARALLEL VECTOR ENGINE & WEB FALLBACK CASCADE
 # ---------------------------------------------------------
 
 def safe_parse_groq_json(raw_text: str) -> list:
+    """Extracts JSON arrays or movie titles robustly from LLM response strings."""
     if not raw_text:
         return []
     try:
@@ -416,59 +521,121 @@ def safe_parse_groq_json(raw_text: str) -> list:
 
     return []
 
-def extract_vibe_movies_fast(vibe_prompt: str, selected_language: str, selected_industry: str) -> list:
-    client = get_groq_client()
-    if not client:
+def google_cse_search(query: str) -> list:
+    """Executes site-restricted Google CSE search to pull exact movie title candidates."""
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
         return []
-
-    # CORRECTION 1: Explicit hard rules for Cinema Region Focus
-    industry_instruction = ""
-    if "Hollywood" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return movies from Western/American Cinema (Hollywood). Do NOT include Indian, Korean, or foreign movies."
-    elif "Bollywood" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return Hindi-language Bollywood movies. Do NOT include Hollywood or other regional movies."
-    elif "South Indian" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return South Indian movies (Telugu, Tamil, Malayalam, Kannada cinema)."
-    elif "Indian Cinema" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return Indian cinema movies (Bollywood or Indian regional languages)."
-    elif "East Asian" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return East Asian movies (Korean, Japanese, Chinese cinema)."
-    elif "World Cinema" in selected_industry:
-        industry_instruction = "CRITICAL MANDATE: You MUST ONLY return international or world cinema movies outside Hollywood and India."
-
-    system_prompt = f"""
-    You are an expert movie recommendation engine. Return output strictly in JSON format.
-    Provide 15-20 distinct, real, existing movie titles that match the vibe: "{vibe_prompt}".
-    Do NOT add years in parentheses (e.g., return "Sultan" NOT "Sultan (2016)").
-    
-    Language Filter: {selected_language}
-    Industry Filter: {selected_industry}
-    {industry_instruction}
-    
-    Return JSON as:
-    {{
-      "movies": [
-        "Movie Title 1",
-        "Movie Title 2"
-      ]
-    }}
-    """
-
     try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "system", "content": system_prompt}],
-            temperature=0.3,
-            max_tokens=1500,
-            response_format={"type": "json_object"}
-        )
-        return safe_parse_groq_json(response.choices[0].message.content)
+        req_url = f"https://www.googleapis.com/customsearch/v1?key={GOOGLE_SEARCH_API_KEY}&cx={GOOGLE_CSE_ID}&q={urllib.parse.quote(query + ' site:themoviedb.org/movie/')}"
+        res = session.get(req_url, timeout=5.0)
+        if res.status_code == 200:
+            items = res.json().get("items", [])
+            titles = []
+            for it in items:
+                raw_t = it.get("title", "")
+                clean_t = raw_t.split("—")[0].split("-")[0].replace("TMDB", "").strip()
+                if clean_t:
+                    titles.append(clean_t)
+            return titles
+    except Exception:
+        pass
+    return []
+
+def execute_web_fallback_cascade(vibe_prompt: str, selected_language: str, selected_industry: str) -> list:
+    """3-Step Fallback Cascade: Google CSE -> Groq LLM Parsing -> TMDB Hydration."""
+    # Step 1: Google CSE Search
+    google_titles = google_cse_search(vibe_prompt)
+    
+    # Step 2: Groq LLM Extractor
+    client = get_groq_client()
+    groq_titles = []
+    if client:
+        industry_instruction = ""
+        if "Hollywood" in selected_industry:
+            industry_instruction = "CRITICAL MANDATE: Only return Western/American Cinema (Hollywood)."
+        elif "Bollywood" in selected_industry:
+            industry_instruction = "CRITICAL MANDATE: Only return Hindi-language Bollywood movies."
+        elif "South Indian" in selected_industry:
+            industry_instruction = "CRITICAL MANDATE: Only return South Indian movies."
+        elif "Indian Cinema" in selected_industry:
+            industry_instruction = "CRITICAL MANDATE: Only return Indian cinema movies."
+        elif "East Asian" in selected_industry:
+            industry_instruction = "CRITICAL MANDATE: Only return East Asian movies."
+
+        sys_p = f"""Return output strictly in JSON. Provide 10-15 real movies matching vibe: "{vibe_prompt}".
+Language: {selected_language} | Industry: {selected_industry} | {industry_instruction}
+Format: {{"movies": ["Title 1", "Title 2"]}}"""
+
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "system", "content": sys_p}],
+                temperature=0.3,
+                max_tokens=1000,
+                response_format={"type": "json_object"}
+            )
+            groq_titles = safe_parse_groq_json(resp.choices[0].message.content)
+        except Exception:
+            pass
+
+    # Combine candidates
+    combined_raw_titles = list(dict.fromkeys(google_titles + groq_titles))
+    
+    # Step 3: TMDB Hydration
+    hydrated_movies = []
+    def enrich(title):
+        return fetch_single_movie_cached(title, target_language=selected_language)
+
+    with ThreadPoolExecutor(max_workers=4) as exec_pool:
+        results = list(exec_pool.map(enrich, combined_raw_titles))
+        hydrated_movies = [m for m in results if m]
+
+    return hydrated_movies
+
+def query_local_index_stream(vibe_prompt: str, k: int = 15) -> list:
+    """THREAD 1: Searches FAISS local index using L2 vector distance."""
+    if FAISS_INDEX.ntotal == 0:
+        return []
+    
+    q_vec = EMBEDDING_MODEL.encode([vibe_prompt], convert_to_numpy=True)
+    faiss.normalize_L2(q_vec)
+    
+    distances, indices = FAISS_INDEX.search(q_vec, min(k, FAISS_INDEX.ntotal))
+    
+    local_candidates = []
+    for idx, dist in zip(indices[0], distances[0]):
+        if idx != -1:
+            m_obj = VECTOR_METADATA.get(str(idx))
+            if m_obj:
+                local_candidates.append({
+                    "movie": m_obj,
+                    "distance": float(dist)
+                })
+    return local_candidates
+
+def live_fetch_and_vectorize_stream(selected_language: str) -> list:
+    """THREAD 2: Fetches fresh /now_playing TMDB movies, vectorizes & computes inline distance."""
+    try:
+        res = session.get(f"{TMDB_BASE}/movie/now_playing", params={"api_key": TMDB_API_KEY}, timeout=4.0)
+        if res.status_code != 200:
+            return []
+        
+        raw_items = res.json().get("results", [])
+        existing_ids = {str(m["id"]) for m in VECTOR_METADATA.values() if isinstance(m, dict) and "id" in m}
+        
+        fresh_movies = []
+        for item in raw_items:
+            if str(item.get("id")) not in existing_ids:
+                fmt = format_tmdb_movie_item(item, selected_language)
+                if fmt:
+                    fresh_movies.append(fmt)
+        return fresh_movies
     except Exception:
         return []
 
 def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_industry: str, target_movie_obj=None, status_container=None):
     results = []
-
+    
     # 1. TMDB Native Recommendations (if target movie exists)
     if target_movie_obj and isinstance(target_movie_obj.get("id"), int):
         if status_container:
@@ -476,30 +643,56 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
         tmdb_recs = fetch_tmdb_direct_recommendations(target_movie_obj["id"], selected_language)
         results.extend(tmdb_recs)
 
-    # 2. AI Vibe Search
+    # 2. PARALLEL DUAL-STREAM SEARCH (Thread 1: Local FAISS + Thread 2: Live TMDB Vectorize)
     if status_container:
-        status_container.write("🧠 Finding matching vibe titles...")
-    
-    groq_titles = extract_vibe_movies_fast(vibe_prompt, selected_language, selected_industry)
+        status_container.write("⚡ Executing Parallel Dual-Stream Vector Search...")
 
-    if groq_titles:
+    local_candidates = []
+    live_movies = []
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(query_local_index_stream, vibe_prompt, 15)
+        f2 = executor.submit(live_fetch_and_vectorize_stream, selected_language)
+        
+        local_candidates = f1.result()
+        live_movies = f2.result()
+
+    # Score and vector merge
+    best_distance = 999.0
+    for cand in local_candidates:
+        results.append(cand["movie"])
+        if cand["distance"] < best_distance:
+            best_distance = cand["distance"]
+
+    # Process and append live stream candidates
+    if live_movies:
+        q_vec = EMBEDDING_MODEL.encode([vibe_prompt], convert_to_numpy=True)
+        faiss.normalize_L2(q_vec)
+        
+        for lm in live_movies:
+            doc = f"{lm.get('title', '')} {lm.get('genres', '')} {lm.get('overview', '')}"
+            m_vec = EMBEDDING_MODEL.encode([doc], convert_to_numpy=True)
+            faiss.normalize_L2(m_vec)
+            
+            l2_dist = float(np.linalg.norm(q_vec - m_vec))
+            results.append(lm)
+            
+            if l2_dist < best_distance:
+                best_distance = l2_dist
+
+    # 3. DISTANCE DECISION GATE (0.35 L2 Threshold Check)
+    if best_distance > DISTANCE_THRESHOLD or not results:
         if status_container:
-            status_container.write(f"⚡ Fetching verified TMDB details for {len(groq_titles)} titles...")
+            status_container.write(f"🌐 Distance Gate Triggered (Min Distance: {best_distance:.2f} > 0.35). Launching Web Fallback Cascade...")
+        
+        fallback_movies = execute_web_fallback_cascade(vibe_prompt, selected_language, selected_industry)
+        results.extend(fallback_movies)
 
-        def enrich(title):
-            t_str = title.get("title", "") if isinstance(title, dict) else str(title)
-            return fetch_single_movie_cached(t_str, target_language=selected_language)
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            groq_results = list(executor.map(enrich, groq_titles))
-            results.extend([m for m in groq_results if m])
-
-    # 3. Deduplication and Cleaning
+    # 4. Deduplication & Cleaning
     unique_movies = []
     seen_ids = set()
     seen_titles = set()
 
-    # CORRECTION 2: Prepend searched movie directly as Card #1 instead of pre-blocking it
     if target_movie_obj and isinstance(target_movie_obj.get("id"), int):
         unique_movies.append(target_movie_obj)
         seen_ids.add(target_movie_obj["id"])
@@ -514,13 +707,13 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
                 seen_titles.add(norm_title)
                 unique_movies.append(item)
 
-    # 4. Trending Fallback
+    # 5. Trending Fallback
     if not unique_movies:
         if status_container:
             status_container.write("🍿 Fetching top trending movies...")
         unique_movies = fetch_fallback_trending_movies(selected_language)
 
-    # Keep target movie as Card #1 while sorting all remaining vibe recommendations by popularity/rating
+    # Sort final candidates
     if target_movie_obj and isinstance(target_movie_obj.get("id"), int) and len(unique_movies) > 1:
         target_card = unique_movies[0]
         recs_cards = unique_movies[1:]
@@ -528,6 +721,13 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
         unique_movies = [target_card] + recs_cards
     else:
         unique_movies.sort(key=lambda x: (x.get("rating", 0), x.get("popularity", 0)), reverse=True)
+
+    # 6. MUTEX WRITE-BACK TO FAISS PERSISTENT STORE
+    def background_persist():
+        for m in unique_movies:
+            append_to_vector_db_mutex(m)
+
+    threading.Thread(target=background_persist, daemon=True).start()
 
     return unique_movies
 
@@ -636,13 +836,24 @@ if st.button("Explore Movies 🚀", type="primary"):
             st.session_state["searched_movie_info"] = target_movie
             
             vibe_q = f"{user_query} epic drama action" if not target_movie else f"{target_movie['title']} {target_movie['genres']} epic vibe"
-            st.session_state["search_results"] = search_by_vibe_pipeline(
+            
+            raw_results = search_by_vibe_pipeline(
                 vibe_prompt=vibe_q,
                 selected_language=selected_lang,
                 selected_industry=selected_industry,
                 target_movie_obj=target_movie,
                 status_container=status_box
             )
+            
+            # DEDUPLICATION FIX: Exclude searched movie from recommendation results
+            if target_movie and "id" in target_movie and raw_results:
+                target_id = target_movie["id"]
+                st.session_state["search_results"] = [
+                    m for m in raw_results if m.get("id") != target_id
+                ]
+            else:
+                st.session_state["search_results"] = raw_results
+
         else:
             st.session_state["searched_movie_info"] = None
             st.session_state["search_results"] = search_by_vibe_pipeline(
@@ -741,7 +952,7 @@ else:
         with col_s2:
             st.markdown(f"⭐ **TMDB Rating:** {s_movie['rating']}/10 | 🏷️ **Genres:** `{s_movie['genres']}`")
             st.markdown(f"🗣️ **Audio:** `{s_movie['audio']}` | 💬 **Subs:** `{s_movie['subtitles']}`")
-            st.write(f"📖 **Overview:** {s_movie['overview']}")
+            st.write(f"📖 **pip install streamlit sentence-transformers faiss-cpu requests python-dotenv groq numpyOverview:** {s_movie['overview']}")
             
             st.markdown("#### 🍿 Official Trailer")
             s_trailer = get_movie_trailer_url(s_movie["id"])
