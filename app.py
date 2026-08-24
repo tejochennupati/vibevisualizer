@@ -10,6 +10,8 @@ import os
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 # Limit CPU threads to prevent CPU thrashing during initial load
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -36,8 +38,11 @@ load_dotenv()
 
 @st.cache_resource(show_spinner="⚡ Initializing Search Engine...")
 def load_embedding_model():
-    from sentence_transformers import SentenceTransformer
+    import torch
+    torch.set_num_threads(2)
+    torch.set_num_threads(2)  # Adjust CPU core usage
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+
 
 get_embedding_model = load_embedding_model
 
@@ -192,9 +197,6 @@ def get_groq_client():
 # 1.5 FAISS VECTOR DB & EMBEDDINGS INIT
 # ---------------------------------------------------------
 
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
 
 EMBEDDING_MODEL = load_embedding_model()
 
@@ -224,7 +226,8 @@ def append_to_vector_db_mutex(movie_obj: dict):
     if m_id_str in VECTOR_METADATA.values():
         return
 
-    doc = f"{movie_obj.get('title', '')} {movie_obj.get('genres', '')} {movie_obj.get('overview', '')}"
+    vibe_str = movie_obj.get('vibe_reason', '')
+    doc = f"{movie_obj.get('title', '')} {movie_obj.get('genres', '')} {movie_obj.get('overview', '')} {vibe_str}".strip()
     vec = EMBEDDING_MODEL.encode([doc], convert_to_numpy=True)
     faiss.normalize_L2(vec)
 
@@ -643,9 +646,9 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
         tmdb_recs = fetch_tmdb_direct_recommendations(target_movie_obj["id"], selected_language)
         results.extend(tmdb_recs)
 
-    # 2. PARALLEL DUAL-STREAM SEARCH (Thread 1: Local FAISS + Thread 2: Live TMDB Vectorize)
+    # 2. RETRIEVAL STEP: Parallel Dual-Stream Vector Search (FAISS + Live Stream)
     if status_container:
-        status_container.write("⚡ Executing Parallel Dual-Stream Vector Search...")
+        status_container.write("⚡ [RAG Step 1/3] Retrieving candidates from FAISS Vector Index...")
 
     local_candidates = []
     live_movies = []
@@ -657,14 +660,12 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
         local_candidates = f1.result()
         live_movies = f2.result()
 
-    # Score and vector merge
     best_distance = 999.0
     for cand in local_candidates:
         results.append(cand["movie"])
         if cand["distance"] < best_distance:
             best_distance = cand["distance"]
 
-    # Process and append live stream candidates
     if live_movies:
         q_vec = EMBEDDING_MODEL.encode([vibe_prompt], convert_to_numpy=True)
         faiss.normalize_L2(q_vec)
@@ -680,7 +681,7 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
             if l2_dist < best_distance:
                 best_distance = l2_dist
 
-    # 3. DISTANCE DECISION GATE (0.35 L2 Threshold Check)
+    # 3. DISTANCE DECISION GATE (Web Fallback)
     if best_distance > DISTANCE_THRESHOLD or not results:
         if status_container:
             status_container.write(f"🌐 Distance Gate Triggered (Min Distance: {best_distance:.2f} > 0.35). Launching Web Fallback Cascade...")
@@ -688,13 +689,13 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
         fallback_movies = execute_web_fallback_cascade(vibe_prompt, selected_language, selected_industry)
         results.extend(fallback_movies)
 
-    # 4. Deduplication & Cleaning
-    unique_movies = []
+    # 4. Deduplication & Cleaning Candidate Pool
+    unique_candidates = []
     seen_ids = set()
     seen_titles = set()
 
     if target_movie_obj and isinstance(target_movie_obj.get("id"), int):
-        unique_movies.append(target_movie_obj)
+        unique_candidates.append(target_movie_obj)
         seen_ids.add(target_movie_obj["id"])
         seen_titles.add(str(target_movie_obj["title"]).strip().lower())
 
@@ -705,31 +706,90 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
             if m_id not in seen_ids and norm_title not in seen_titles:
                 seen_ids.add(m_id)
                 seen_titles.add(norm_title)
-                unique_movies.append(item)
+                unique_candidates.append(item)
 
-    # 5. Trending Fallback
-    if not unique_movies:
+    if not unique_candidates:
         if status_container:
             status_container.write("🍿 Fetching top trending movies...")
-        unique_movies = fetch_fallback_trending_movies(selected_language)
+        unique_candidates = fetch_fallback_trending_movies(selected_language)
 
-    # Sort final candidates
-    if target_movie_obj and isinstance(target_movie_obj.get("id"), int) and len(unique_movies) > 1:
-        target_card = unique_movies[0]
-        recs_cards = unique_movies[1:]
-        recs_cards.sort(key=lambda x: (x.get("rating", 0), x.get("popularity", 0)), reverse=True)
-        unique_movies = [target_card] + recs_cards
+    # Limit context window to top 10 candidates for the LLM
+    candidate_pool = unique_candidates[:10]
+
+    # 5. AUGMENTATION & GENERATION STEP: Pass Context to Groq LLM
+    if status_container:
+        status_container.write("🧠 [RAG Step 2/3 & 3/3] Augmenting prompt & generating explanations with Groq LLM...")
+
+    # Build context string of retrieved movies
+    context_str = "\n".join([
+        f"- ID: {m['id']} | Title: {m['title']} ({m.get('year', 'N/A')}) | Genres: {m.get('genres', '')} | Overview: {m.get('overview', '')[:120]}..."
+        for m in candidate_pool
+    ])
+
+    system_prompt = f"""You are an expert movie discovery AI.
+User Query / Vibe: "{vibe_prompt}"
+Selected Region: {selected_industry} | Language: {selected_language}
+
+RETRIEVED CANDIDATE MOVIES FROM VECTOR DATABASE:
+{context_str}
+
+TASK:
+1. Select the top movies from the RETRIEVED CANDIDATES list that best fit the user's requested vibe.
+2. For each selected movie, provide a concise 1-2 sentence "vibe_reason" explaining WHY it matches the requested vibe.
+3. STRICT RULE: Pick ONLY from the provided candidate list. Do not invent fake movies.
+
+Return strictly valid JSON format:
+{{
+  "recommendations": [
+    {{
+      "id": 12345,
+      "title": "Movie Title",
+      "vibe_reason": "Why this matches the vibe..."
+    }}
+  ]
+}}"""
+
+    final_rag_results = []
+    client = get_groq_client()
+
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "system", "content": system_prompt}],
+                temperature=0.2,
+                max_tokens=800,
+                response_format={"type": "json_object"}
+            )
+            
+            llm_json = json.loads(resp.choices[0].message.content)
+            selected_items = llm_json.get("recommendations", [])
+
+            # Hydrate full movie dicts with the generated vibe_reason
+            candidate_dict = {m["id"]: m for m in candidate_pool}
+            for item in selected_items:
+                m_id = item.get("id")
+                if m_id in candidate_dict:
+                    movie_data = candidate_dict[m_id].copy()
+                    movie_data["vibe_reason"] = item.get("vibe_reason", movie_data.get("overview", ""))
+                    final_rag_results.append(movie_data)
+
+        except Exception:
+            final_rag_results = candidate_pool
     else:
-        unique_movies.sort(key=lambda x: (x.get("rating", 0), x.get("popularity", 0)), reverse=True)
+        final_rag_results = candidate_pool
+
+    if not final_rag_results:
+        final_rag_results = candidate_pool
 
     # 6. MUTEX WRITE-BACK TO FAISS PERSISTENT STORE
     def background_persist():
-        for m in unique_movies:
+        for m in final_rag_results:
             append_to_vector_db_mutex(m)
 
     threading.Thread(target=background_persist, daemon=True).start()
 
-    return unique_movies
+    return final_rag_results
 
 # ---------------------------------------------------------
 # 5. STREAMLIT UI - SEARCH & CONTROLS
@@ -928,7 +988,8 @@ if st.session_state["selected_movie"]:
             for idx, r_movie in enumerate(r_row_movies):
                 with r_cols[idx]:
                     st.image(r_movie["poster"], use_container_width=True)
-                    st.markdown(f"<div class='card-title'><b>{r_movie['title']}</b> ({r_movie['year']})</div>", unsafe_allow_html=True)
+                    desc_text = movie.get('vibe_reason', movie.get('overview', ''))
+                    st.markdown(f"<div class='card-desc'>{desc_text}</div>", unsafe_allow_html=True)
                     st.caption(f"⭐ {r_movie['rating']}/10")
                     if st.button("Watch Details ▶", key=f"rec_btn_{r_movie['id']}_{i}_{idx}"):
                         st.session_state["selected_movie"] = r_movie
