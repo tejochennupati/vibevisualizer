@@ -453,6 +453,79 @@ def get_movie_trailer_url(movie_id: int) -> str:
             pass
     return None
 
+# ---------------------------------------------------------
+# STEP 4: FUNCTION CALLING / TOOLS DEFINITIONS & HANDLERS
+# ---------------------------------------------------------
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_movie_trailer",
+            "description": "Fetch official YouTube trailer URL for a movie title or TMDB movie ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "movie_id": {
+                        "type": "integer",
+                        "description": "The TMDB numerical ID of the movie."
+                    },
+                    "movie_title": {
+                        "type": "string",
+                        "description": "The title of the movie."
+                    }
+                },
+                "required": ["movie_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_movies_by_criteria",
+            "description": "Filter candidate movies strictly by minimum rating or release year cutoff.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_rating": {
+                        "type": "number",
+                        "description": "Minimum TMDB vote rating out of 10 (e.g. 7.5)."
+                    },
+                    "min_year": {
+                        "type": "integer",
+                        "description": "Minimum release year cutoff (e.g. 2010)."
+                    }
+                }
+            }
+        }
+    }
+]
+
+def execute_tool_call(tool_name: str, arguments: dict, candidate_pool: list) -> dict:
+    """Executes local Python function based on Groq tool decisions."""
+    if tool_name == "get_movie_trailer":
+        m_id = arguments.get("movie_id")
+        trailer_url = get_movie_trailer_url(m_id)
+        return {"movie_id": m_id, "trailer_url": trailer_url}
+
+    elif tool_name == "filter_movies_by_criteria":
+        min_rating = arguments.get("min_rating", 0.0)
+        min_year = arguments.get("min_year", 0)
+        
+        filtered = []
+        for m in candidate_pool:
+            try:
+                yr = int(m.get("year", 0))
+            except Exception:
+                yr = 0
+            rt = float(m.get("rating", 0.0))
+            
+            if rt >= min_rating and yr >= min_year:
+                filtered.append(m)
+        return {"filtered_candidates": filtered}
+
+    return {}
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tmdb_direct_recommendations(movie_id: int, target_language: str):
     if not TMDB_API_KEY or not movie_id or not isinstance(movie_id, int):
@@ -716,17 +789,16 @@ def search_by_vibe_pipeline(vibe_prompt: str, selected_language: str, selected_i
     # Limit context window to top 10 candidates for the LLM
     candidate_pool = unique_candidates[:10]
 
-    # 5. AUGMENTATION & GENERATION STEP: Pass Context to Groq LLM
+    # 5. AUGMENTATION & GENERATION STEP: Function Calling & Groq LLM
     if status_container:
-        status_container.write("🧠 [RAG Step 2/3 & 3/3] Augmenting prompt & generating explanations with Groq LLM...")
+        status_container.write("🧠 [RAG Step 2/3 & 3/3] Executing Tool Calls & Generating Explanations...")
 
-    # Build context string of retrieved movies
     context_str = "\n".join([
-        f"- ID: {m['id']} | Title: {m['title']} ({m.get('year', 'N/A')}) | Genres: {m.get('genres', '')} | Overview: {m.get('overview', '')[:120]}..."
+        f"- ID: {m['id']} | Title: {m['title']} ({m.get('year', 'N/A')}) | Rating: {m.get('rating', 'N/A')} | Overview: {m.get('overview', '')[:120]}..."
         for m in candidate_pool
     ])
 
-    system_prompt = f"""You are an expert movie discovery AI.
+    system_prompt = f"""You are an expert movie discovery AI with function-calling capabilities.
 User Query / Vibe: "{vibe_prompt}"
 Selected Region: {selected_industry} | Language: {selected_language}
 
@@ -734,9 +806,9 @@ RETRIEVED CANDIDATE MOVIES FROM VECTOR DATABASE:
 {context_str}
 
 TASK:
-1. Select the top movies from the RETRIEVED CANDIDATES list that best fit the user's requested vibe.
-2. For each selected movie, provide a concise 1-2 sentence "vibe_reason" explaining WHY it matches the requested vibe.
-3. STRICT RULE: Pick ONLY from the provided candidate list. Do not invent fake movies.
+1. If the user specifies numeric constraints (e.g. rating > 7.5 or released after 2015), call `filter_movies_by_criteria`.
+2. Select the top movies matching the vibe from the candidates list.
+3. For each selected movie, provide a concise 1-2 sentence "vibe_reason".
 
 Return strictly valid JSON format:
 {{
@@ -754,18 +826,51 @@ Return strictly valid JSON format:
 
     if client:
         try:
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Initial Groq call supplying tools schema
             resp = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                messages=[{"role": "system", "content": system_prompt}],
+                messages=messages,
+                tools=TOOLS_SCHEMA,
+                tool_choice="auto",
                 temperature=0.2,
                 max_tokens=800,
                 response_format={"type": "json_object"}
             )
             
-            llm_json = json.loads(resp.choices[0].message.content)
-            selected_items = llm_json.get("recommendations", [])
+            response_msg = resp.choices[0].message
+            
+            # Execute tool if requested by the LLM
+            if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
+                for tool_call in response_msg.tool_calls:
+                    fn_name = tool_call.function.name
+                    fn_args = json.loads(tool_call.function.arguments)
+                    tool_result = execute_tool_call(fn_name, fn_args, candidate_pool)
+                    
+                    if fn_name == "filter_movies_by_criteria" and tool_result.get("filtered_candidates"):
+                        candidate_pool = tool_result["filtered_candidates"]
+                    
+                    messages.append(response_msg)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(tool_result)
+                    })
+                
+                # Second Groq call after returning tool results
+                second_resp = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=800,
+                    response_format={"type": "json_object"}
+                )
+                llm_json = json.loads(second_resp.choices[0].message.content)
+            else:
+                llm_json = json.loads(response_msg.content)
 
-            # Hydrate full movie dicts with the generated vibe_reason
+            selected_items = llm_json.get("recommendations", [])
             candidate_dict = {m["id"]: m for m in candidate_pool}
             for item in selected_items:
                 m_id = item.get("id")
