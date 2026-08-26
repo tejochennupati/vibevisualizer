@@ -30,6 +30,7 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from groq import Groq
+import pyrebase
 
 # ---------------------------------------------------------
 # 1. SETUP & CONFIGURATION
@@ -65,7 +66,17 @@ EMBEDDING_MODEL = load_embedding_model()
 FAISS_INDEX, MOVIE_METADATA = load_vector_db()
 
 def get_secret(key: str, default=None):
-    return os.getenv(key) or (st.secrets.get(key) if hasattr(st, "secrets") else None) or default
+    # Check .env / environment variables first
+    val = os.getenv(key)
+    if val:
+        return val
+    # Check Streamlit secrets safely without throwing an exception
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return default
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 TMDB_API_KEY = get_secret("TMDB_API_KEY")
@@ -900,8 +911,88 @@ Return strictly valid JSON format:
 # 5. STREAMLIT UI - SEARCH & CONTROLS
 # ---------------------------------------------------------
 
+# FIREBASE REST AUTHENTICATION GATE
+# ---------------------------------------------------------
+
+# 1. Fetch the API Key directly from .streamlit/secrets.toml
+FIREBASE_API_KEY = st.secrets["FIREBASE_API_KEY"]
+
+# 2. Define the Firebase Auth v1 REST Endpoints
+SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
+LOGIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+
+# 3. Track authentication & modal states
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "show_login_modal" not in st.session_state:
+    st.session_state["show_login_modal"] = False
+
+# 4. Auth Popup Dialog
+@st.dialog("🔒 Login / Sign Up")
+def show_auth_modal():
+    st.write("Please log in or create an account to access features.")
+    tab1, tab2 = st.tabs(["🔑 Log In", "📝 Sign Up"])
+    
+    with tab1:
+        email = st.text_input("Email", key="modal_login_email")
+        password = st.text_input("Password", type="password", key="modal_login_pass")
+        if st.button("Log In Now", use_container_width=True):
+            payload = {"email": email, "password": password, "returnSecureToken": True}
+            res = requests.post(LOGIN_URL, json=payload)
+            data = res.json()
+            
+            if res.status_code == 200:
+                st.session_state["user"] = {
+                    "email": data["email"],
+                    "idToken": data["idToken"],
+                    "localId": data["localId"]
+                }
+                st.session_state["show_login_modal"] = False
+                st.rerun()
+            else:
+                err_msg = data.get("error", {}).get("message", "Login failed.")
+                st.error(f"Login error: {err_msg}")
+                
+    with tab2:
+        new_email = st.text_input("Email", key="modal_signup_email")
+        new_password = st.text_input("Password", type="password", key="modal_signup_pass")
+        if st.button("Create Account", use_container_width=True):
+            payload = {"email": new_email, "password": new_password, "returnSecureToken": True}
+            res = requests.post(SIGNUP_URL, json=payload)
+            data = res.json()
+            
+            if res.status_code == 200:
+                st.success("Account created successfully! You can now log in.")
+            else:
+                err_msg = data.get("error", {}).get("message", "Sign up failed.")
+                if "EMAIL_EXISTS" in err_msg:
+                    st.error("This email is already registered. Please log in.")
+                elif "WEAK_PASSWORD" in err_msg:
+                    st.error("Password must be at least 6 characters long.")
+                else:
+                    st.error(f"Sign up error: {err_msg}")
+
+# 2. Top-Left User Status Bar & Header Layout
+top_col1, top_col2 = st.columns([1.5, 3.5])
+with top_col1:
+    if st.session_state["user"]:
+        st.write(f"👤 **{st.session_state['user']['email'].split('@')[0]}**")
+        if st.button("🚪 Log Out", key="top_logout_btn"):
+            st.session_state["user"] = None
+            st.session_state["show_login_modal"] = False
+            st.rerun()
+    else:
+        if st.button("🔑 Log In / Sign Up", key="top_login_btn"):
+            st.session_state["show_login_modal"] = True
+
+# 3. Open Dialog when flag is True
+if st.session_state["show_login_modal"] and not st.session_state["user"]:
+    show_auth_modal()
+
 st.title("🎬 VibeVisualizer")
 st.caption("High-Yield Vibe Discovery Engine across Indian, Hollywood & World Cinema.")
+
+
 # --- SIDEBAR MEMORY CONTROL PANEL ---
 init_memory()
 
@@ -919,7 +1010,11 @@ with st.sidebar:
     tab_favs, tab_hist = st.tabs(["⭐ Favorites", "📜 History"])
     
     with tab_favs:
-        if st.session_state["favorite_movies"]:
+        if not st.session_state["user"]:
+            st.info("💡 Log in to view and manage your favorite movies.")
+            if st.button("🔒 Unlock Favorites", key="unlock_favs_btn", use_container_width=True):
+                show_auth_modal("view your favorites")
+        elif st.session_state["favorite_movies"]:
             for fav in st.session_state["favorite_movies"]:
                 col_title, col_play, col_del = st.columns([3, 1, 1])
                 with col_title:
@@ -940,7 +1035,11 @@ with st.sidebar:
             st.info("No saved movies yet.")
 
     with tab_hist:
-        if st.session_state["search_history"]:
+        if not st.session_state["user"]:
+            st.info("💡 Log in to view your search history.")
+            if st.button("🔒 Unlock History", key="unlock_hist_btn", use_container_width=True):
+                show_auth_modal("view your search history")
+        elif st.session_state["search_history"]:
             for idx, past_query in enumerate(list(st.session_state["search_history"])):
                 col_q, col_qdel = st.columns([4, 1])
                 with col_q:
@@ -986,7 +1085,9 @@ search_mode = st.radio(
 )
 
 if st.button("Explore Movies 🚀", type="primary"):
-    if not user_query.strip():
+    if not st.session_state["user"]:
+        show_auth_modal("explore recommendations")
+    elif not user_query.strip():
         st.info("Please enter a vibe or movie title above!")
     else:
         save_search_to_memory(user_query)
@@ -1155,12 +1256,18 @@ else:
 
                     with col_b1:
                         if st.button("🎬 Details", key=f"card_btn_{movie['id']}_{i}_{idx}"):
-                            st.session_state["selected_movie"] = movie
-                            st.rerun()
+                            if not st.session_state["user"]:
+                                show_auth_modal("view movie details & trailers")
+                            else:
+                                st.session_state["selected_movie"] = movie
+                                st.rerun()
 
                     with col_b2:
                         is_saved = any(m.get("id") == movie["id"] for m in st.session_state["favorite_movies"])
                         fav_label = "❤️ Saved" if is_saved else "🤍 Save"
                         if st.button(fav_label, key=f"card_fav_{movie['id']}_{i}_{idx}"):
-                            toggle_favorite(movie)
-                            st.rerun()
+                            if not st.session_state["user"]:
+                                show_auth_modal("save movies to your favorites")
+                            else:
+                                toggle_favorite(movie)
+                                st.rerun()
