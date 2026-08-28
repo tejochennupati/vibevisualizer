@@ -44,7 +44,7 @@ Toggle seamlessly between two powerful search paths using the top menu:
 ```bash
 git clone [https://github.com/your-username/vibe-visualizer.git](https://github.com/your-username/vibe-visualizer.git)
 cd vibe-visualizer
-'''
+```
 ### 2. Set Up Virtual Environment
 
 ```bash
@@ -56,13 +56,13 @@ venv\Scripts\activate
 # On macOS/Linux:
 source venv/bin/activate
 
-'''
+```
 ### 3. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 
-'''
+```
 ### 4. Configure Environment Secrets
 
 Create a .streamlit/secrets.toml file (or a .env file) in the root directory and add your credentials:
@@ -73,14 +73,14 @@ GROQ_API_KEY = "your_groq_api_key"
 TMDB_API_KEY = "your_tmdb_api_key"
 FIREBASE_API_KEY = "your_firebase_api_key"
 FIREBASE_DATABASE_URL = "[https://your-firebase-database-default-rtdb.firebaseio.com](https://your-firebase-database-default-rtdb.firebaseio.com)"
-'''
+```
 ### 🏃 Running the Application
 Launch the Streamlit app with:
 
 ```bash
 
 streamlit run app.py
-'''
+```
 ### 📁 Project Structure
 
 ```bash
@@ -96,7 +96,7 @@ vibe-visualizer/
 ├── requirements.txt        # Project dependencies
 └── README.md               # Project documentation
 
-'''
+```
 ### 🗺️ Architectural Roadmap: Transitioning to Agentic AI
 To evolve VibeVisualizer from a single-domain retrieval pipeline into an Autonomous Multi-Agent System, the following upgrades are planned:
 
